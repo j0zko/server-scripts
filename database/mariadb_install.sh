@@ -8,7 +8,7 @@ INTERNAL_IP="192.168.100.2"  # This DB server on internal network
 
 DB_NAME="nextcloud"
 DB_USER="ncuser"
-DB_PASS="Strongpass123!"
+DB_PASS="SilnaDatabaza123"
 
 # Check for root
 if [ "$EUID" -ne 0 ]; then
