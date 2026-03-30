@@ -1,6 +1,5 @@
 #!/bin/bash
-
-# Nastavenie základných parametrov pre Database Server (Debian)
+# Nastavenie základných parametrov pre Database Server (Debian) - Netplan version
 
 if [ "$EUID" -ne 0 ]; then
   echo "Prosím, spusťte skript ako root (sudo)."
@@ -15,20 +14,24 @@ TIMEZONE="Europe/Bratislava"
 
 # ens3 — NAT interface (internet + SSH from host)
 NAT_IP="10.0.2.16"
-NAT_NETMASK="255.255.255.0"
 NAT_GW="10.0.2.2"
-NAT_DNS="8.8.8.8"
+NAT_DNS="8.8.8.8,1.1.1.1" # netplan format (comma separated, no spaces)
 
 # ens4 — internal VM-to-VM network
 INTERNAL_IP="192.168.100.2"
-INTERNAL_NETMASK="255.255.255.0"
+INTERNAL_PREFIX="24"
+
+NETPLAN_FILE="/etc/netplan/01-db-config.yaml"
 
 # Auto-detect NICs
-NAT_IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | sed -n '1p')
-INTERNAL_IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | sed -n '2p')
+# NAT_IFACE = interface with default route (most reliable)
+NAT_IFACE=$(ip route | awk '/default/ {print $5}' | head -n1)
 
-echo "[INFO] NAT interface:      $NAT_IFACE"
-echo "[INFO] Internal interface: ${INTERNAL_IFACE:-not detected}"
+# INTERNAL_IFACE = any other ethernet interface
+INTERNAL_IFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | grep -v "$NAT_IFACE" | head -n1)
+
+echo "[INFO] NAT interface: ${NAT_IFACE:-ens3}"
+echo "[INFO] Internal interface: ${INTERNAL_IFACE:-not detected yet}"
 
 # --- 1. Hostname ---
 echo "[1/4] Nastavujem hostname na '$DB_HOSTNAME'..."
@@ -40,67 +43,54 @@ echo "127.0.1.1 $DB_HOSTNAME" >>/etc/hosts
 echo "[2/4] Nastavujem časovú zónu $TIMEZONE..."
 timedatectl set-timezone "$TIMEZONE"
 
-# --- 3. Network ---
-echo "[3/4] Konfigurujem sieťové rozhrania..."
+# --- 3. Network (Netplan) ---
+echo "[3/4] Konfigurujem sieťové rozhrania (netplan)..."
 
-if [ -n "$INTERNAL_IFACE" ]; then
-  cat >/etc/network/interfaces <<EOF
-# Základná konfigurácia vytvorená skriptom
-auto lo
-iface lo inet loopback
+# Remove old interfaces config to avoid conflicts
+rm -f /etc/network/interfaces /etc/network/interfaces.d/*
 
-# NAT interface — internet + SSH from host
-auto $NAT_IFACE
-iface $NAT_IFACE inet static
-    address $NAT_IP
-    netmask $NAT_NETMASK
-    gateway $NAT_GW
-    dns-nameservers $NAT_DNS
+# Create netplan config
+cat >"$NETPLAN_FILE" <<EOF
+network:
+  version: 2
+  ethernets:
+    ${NAT_IFACE:-ens3}:
+      dhcp4: no
+      addresses: [$NAT_IP/24]
+      routes:
+        - to: default
+          via: $NAT_GW
+      nameservers:
+        addresses: [$NAT_DNS]
 
-# Internal VM-to-VM network
-auto $INTERNAL_IFACE
-iface $INTERNAL_IFACE inet static
-    address $INTERNAL_IP
-    netmask $INTERNAL_NETMASK
+    ${INTERNAL_IFACE:-ens4}:
+      dhcp4: no
+      addresses: [$INTERNAL_IP/$INTERNAL_PREFIX]
 EOF
-else
-  echo "[WARN] Second NIC not detected — using ens4 as placeholder"
-  cat >/etc/network/interfaces <<EOF
-# Základná konfigurácia vytvorená skriptom
-auto lo
-iface lo inet loopback
 
-# NAT interface — internet + SSH from host
-auto $NAT_IFACE
-iface $NAT_IFACE inet static
-    address $NAT_IP
-    netmask $NAT_NETMASK
-    gateway $NAT_GW
-    dns-nameservers $NAT_DNS
+chmod 600 "$NETPLAN_FILE"
 
-# Internal VM-to-VM network (placeholder)
-auto ens4
-iface ens4 inet static
-    address $INTERNAL_IP
-    netmask $INTERNAL_NETMASK
-EOF
+echo "[INFO] Applying netplan configuration..."
+netplan apply
+
+if [ $? -ne 0 ]; then
+  echo "[WARN] netplan apply failed. Check the config with: netplan --debug apply"
 fi
-
-echo "[INFO] Reštartujem sieťové služby..."
-systemctl restart networking
 
 # --- 4. Time sync ---
 echo "[4/4] Inštalujem chrony pre synchronizáciu času..."
+apt update -qq
 apt install -y chrony
-systemctl enable chrony
+systemctl enable --now chrony
 systemctl restart chrony
 
+# --- Summary ---
 echo "----------------------------------------"
 echo "KONFIGURÁCIA JE HOTOVÁ:"
-echo "  Hostname:    $(hostname)"
-echo "  NAT IP:      $NAT_IP (via $NAT_IFACE)"
-echo "  Internal IP: $INTERNAL_IP (via ${INTERNAL_IFACE:-ens4})"
-echo "  Timezone:    $TIMEZONE"
-echo "  Čas:         $(date)"
+echo " Hostname: $(hostname)"
+echo " NAT IP: $NAT_IP (via ${NAT_IFACE:-ens3})"
+echo " Internal IP: $INTERNAL_IP (via ${INTERNAL_IFACE:-ens4})"
+echo " Timezone: $TIMEZONE"
+echo " Čas: $(date)"
 echo "----------------------------------------"
-echo "[INFO] Odporúča sa reštartovať server."
+echo "[INFO] Odporúča sa reštartovať server po spustení druhej VM."
